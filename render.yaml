@@ -17,10 +17,10 @@ services:
     healthCheckPath: /health
     envVars:
       - key: MANIFEST_URL
-        # Set in dashboard — the raw URL of manifest.json in your repo
-        sync: false
+        value: "https://raw.githubusercontent.com/danilo658/burnett-manychat-webhook/refs/heads/main/manifest_fallback.json"
       - key: WEBHOOK_SECRET
-        # Set in dashboard — random string ManyChat passes as ?secret=...
+        # Render auto-generates a random value. Copy it from the dashboard
+        # — you'll paste it into the ManyChat master flow's External Request URL.
         generateValue: true
       - key: MANIFEST_CACHE_TTL
         value: "60"
