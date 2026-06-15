@@ -52,6 +52,15 @@ MANIFEST_URL = os.environ.get(
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
 MANIFEST_CACHE_TTL = int(os.environ.get("MANIFEST_CACHE_TTL", "60"))  # seconds
 
+# ManyChat REST API — used by /dm_apifetch when ManyChat's External Request
+# fails to substitute the comment text variable in the URL. We call back into
+# ManyChat with the subscriber_id (which DOES substitute) and read
+# `last_input_text` from the server-side state.
+MANYCHAT_API_KEY = os.environ.get("MANYCHAT_API_KEY", "")
+MANYCHAT_API_BASE = os.environ.get(
+    "MANYCHAT_API_BASE", "https://api.manychat.com"
+)
+
 # Optional fallback bundled with the deployment if MANIFEST_URL is unreachable
 LOCAL_MANIFEST_PATH = Path(__file__).parent / "manifest_fallback.json"
 
@@ -213,6 +222,106 @@ def dm(
         "view_url": view_url,
         "tag": tag,
         "dm_text": render_dm_body(title, view_url),
+        "manifest_source": source,
+        "user_id": user_id,
+    })
+
+
+def _fetch_subscriber_last_input(subscriber_id: str) -> tuple[str | None, str]:
+    """Call ManyChat's REST API to fetch a subscriber's last input text.
+
+    Returns (last_input_text, error). `error` is empty on success.
+    Tries Instagram endpoint first, falls back to Facebook channel.
+    """
+    if not MANYCHAT_API_KEY:
+        return None, "MANYCHAT_API_KEY not configured"
+    if not subscriber_id:
+        return None, "subscriber_id empty"
+    headers = {"Authorization": f"Bearer {MANYCHAT_API_KEY}"}
+    # Try Instagram channel first
+    endpoints = [
+        f"{MANYCHAT_API_BASE}/fb/subscriber/getInfo",  # Most common; FB API also serves IG contacts
+        f"{MANYCHAT_API_BASE}/instagram/subscriber/getInfo",
+    ]
+    last_err = ""
+    for url in endpoints:
+        try:
+            resp = httpx.get(url, headers=headers,
+                             params={"subscriber_id": subscriber_id}, timeout=5.0)
+            if resp.status_code == 200:
+                data = resp.json()
+                if data.get("status") == "success":
+                    info = data.get("data", {})
+                    txt = info.get("last_input_text") or ""
+                    return txt, ""
+                last_err = f"{url}: {data.get('message', 'no message')}"
+            else:
+                last_err = f"{url}: HTTP {resp.status_code} — {resp.text[:200]}"
+        except Exception as exc:
+            last_err = f"{url}: {type(exc).__name__}: {exc}"
+    return None, last_err or "all endpoints failed"
+
+
+@app.get("/dm_apifetch")
+def dm_apifetch(
+    user_id: str = Query(..., description="ManyChat subscriber_id (substitutes correctly via Contact Id)"),
+    secret: str = Query("", description="Shared secret to gate the endpoint"),
+) -> JSONResponse:
+    """Variant of /dm that fetches the comment text from ManyChat's REST API
+    rather than expecting it in the request. Use this when ManyChat's
+    External Request can't substitute `Last Text Input` into URLs.
+
+    Requires MANYCHAT_API_KEY env var to be set on the deployment.
+    """
+    if WEBHOOK_SECRET and secret != WEBHOOK_SECRET:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    if not user_id:
+        raise HTTPException(status_code=400, detail="Missing user_id")
+
+    last_text, err = _fetch_subscriber_last_input(user_id)
+    if last_text is None:
+        return JSONResponse({
+            "ok": False,
+            "keyword": "",
+            "reason": "api_fetch_failed",
+            "error": err,
+            "user_id": user_id,
+        })
+
+    manifest, source = _load_manifest()
+    kw = _extract_keyword(last_text, set(manifest.keys()))
+    if not kw:
+        return JSONResponse({
+            "ok": False,
+            "keyword": "",
+            "reason": "no_keyword_in_text",
+            "fetched_text": last_text[:200],
+            "manifest_source": source,
+            "user_id": user_id,
+        })
+
+    entry = manifest.get(kw)
+    if not entry:
+        return JSONResponse({
+            "ok": False,
+            "keyword": kw,
+            "reason": "unknown_keyword",
+            "manifest_source": source,
+            "user_id": user_id,
+        })
+
+    title = entry.get("title") or "the playbook"
+    view_url = entry.get("view_url") or ""
+    tag = f"got_{kw.lower()}"
+    return JSONResponse({
+        "ok": True,
+        "keyword": kw,
+        "title": title,
+        "view_url": view_url,
+        "tag": tag,
+        "dm_text": render_dm_body(title, view_url),
+        "fetched_text": last_text[:200],
         "manifest_source": source,
         "user_id": user_id,
     })
