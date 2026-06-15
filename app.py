@@ -131,28 +131,70 @@ def health() -> dict:
         return {"ok": False, "error": exc.detail}
 
 
+def _extract_keyword(text: str, known_keywords: set[str]) -> str | None:
+    """Pick the first known keyword that appears in the comment text.
+
+    Tokenizes on non-alphanumeric chars so we match "DMS please" / "Dms!"
+    / "manychat how" alike. Case-insensitive. Returns the matched
+    keyword in UPPERCASE, or None if no match.
+    """
+    if not text:
+        return None
+    import re
+    # Split on anything that isn't a letter/digit/underscore
+    tokens = re.findall(r"[A-Za-z][A-Za-z0-9]*", text)
+    for tok in tokens:
+        up = tok.upper()
+        if up in known_keywords:
+            return up
+    return None
+
+
 @app.get("/dm")
 def dm(
-    keyword: str = Query(..., description="The UPPERCASE keyword the user commented"),
+    keyword: str = Query("", description="Direct keyword (legacy path) — OR pass `text` to extract from a comment"),
+    text: str = Query("", description="Raw comment text — webhook extracts any known keyword from it"),
     user_id: str = Query("", description="ManyChat subscriber id (informational)"),
     secret: str = Query("", description="Shared secret to gate the endpoint"),
 ) -> JSONResponse:
-    """ManyChat's master flow calls this on every Comment Trigger fire."""
+    """ManyChat's master flow calls this on every Comment Trigger fire.
+
+    Accepts EITHER:
+      - `keyword=DMS` — exact keyword (used when ManyChat's trigger already
+        filtered by Specific Keywords).
+      - `text=DMS%20please` — raw comment text; we extract the first known
+        keyword from it. Use this when the ManyChat trigger is "Any comment"
+        and the 8-keyword limit in Specific Keywords forced us to do
+        extraction here instead.
+    """
 
     if WEBHOOK_SECRET and secret != WEBHOOK_SECRET:
         # Don't leak whether the keyword exists when auth fails
         raise HTTPException(status_code=403, detail="Forbidden")
 
-    kw = (keyword or "").strip().upper()
-    if not kw:
-        raise HTTPException(status_code=400, detail="Missing keyword")
-
     manifest, source = _load_manifest()
+
+    # Direct keyword takes precedence; otherwise try to extract from `text`
+    kw: str | None = None
+    if keyword:
+        kw = keyword.strip().upper()
+    elif text:
+        kw = _extract_keyword(text, set(manifest.keys()))
+
+    if not kw:
+        # No keyword could be resolved — master flow's conditional should END
+        # FLOW here (no DM, no tag). This is the common case when the
+        # "Any comment" trigger fires on an unrelated comment.
+        return JSONResponse({
+            "ok": False,
+            "keyword": "",
+            "reason": "no_keyword_in_text" if text else "missing_input",
+            "manifest_source": source,
+        })
+
     entry = manifest.get(kw)
 
     if not entry:
-        # Don't 404 — ManyChat handles this branch better as a soft "not found"
-        # The master flow's fallback path sends a generic "we'll get back to you"
         return JSONResponse({
             "ok": False,
             "keyword": kw,
