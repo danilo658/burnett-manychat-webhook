@@ -61,6 +61,17 @@ MANYCHAT_API_BASE = os.environ.get(
     "MANYCHAT_API_BASE", "https://api.manychat.com"
 )
 
+# Meta IG webhook — direct from Meta to our endpoint, bypassing ManyChat
+# triggers (which can't expose comment text). When IG receives a comment on
+# Burnett's account, Meta POSTs the event here with the actual text. We then
+# call ManyChat's API to send the DM. Zero per-batch ManyChat UI work.
+META_VERIFY_TOKEN = os.environ.get("META_VERIFY_TOKEN", "")
+META_APP_SECRET = os.environ.get("META_APP_SECRET", "")  # optional: signature validation
+# Burnett's Instagram business account id (the account we're listening on).
+# Used to filter comments that belong to us (Meta sends events for all
+# subscribed pages; we only handle ours). Optional — if unset, accept all.
+META_IG_BUSINESS_ID = os.environ.get("META_IG_BUSINESS_ID", "")
+
 # Optional fallback bundled with the deployment if MANIFEST_URL is unreachable
 LOCAL_MANIFEST_PATH = Path(__file__).parent / "manifest_fallback.json"
 
@@ -260,6 +271,204 @@ def _fetch_subscriber_last_input(subscriber_id: str) -> tuple[str | None, str]:
         except Exception as exc:
             last_err = f"{url}: {type(exc).__name__}: {exc}"
     return None, last_err or "all endpoints failed"
+
+
+# ===========================================================================
+# Meta IG webhook — direct comment → DM, zero ManyChat per-batch work
+# ===========================================================================
+from fastapi import Request  # noqa: E402
+
+
+def _manychat_find_subscriber_by_ig_username(ig_username: str) -> tuple[str | None, str]:
+    """Return (subscriber_id, error). Look up a ManyChat subscriber by IG username."""
+    if not MANYCHAT_API_KEY:
+        return None, "MANYCHAT_API_KEY not configured"
+    if not ig_username:
+        return None, "ig_username empty"
+    headers = {"Authorization": f"Bearer {MANYCHAT_API_KEY}"}
+    try:
+        # ManyChat IG endpoint for finding by IG username
+        resp = httpx.get(
+            f"{MANYCHAT_API_BASE}/fb/subscriber/findByName",
+            headers=headers,
+            params={"name": ig_username},
+            timeout=8.0,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            if data.get("status") == "success":
+                items = data.get("data", [])
+                if items:
+                    # findByName returns a list; pick the first IG match
+                    for sub in items:
+                        if sub.get("ig_username") == ig_username:
+                            return str(sub.get("id")), ""
+                    return str(items[0].get("id")), ""
+                return None, "no subscribers found"
+        return None, f"HTTP {resp.status_code}: {resp.text[:200]}"
+    except Exception as exc:
+        return None, f"{type(exc).__name__}: {exc}"
+
+
+def _manychat_send_content(subscriber_id: str, text: str) -> tuple[bool, str]:
+    """Send a freeform DM to a ManyChat subscriber. Returns (ok, error)."""
+    if not MANYCHAT_API_KEY:
+        return False, "MANYCHAT_API_KEY not configured"
+    headers = {
+        "Authorization": f"Bearer {MANYCHAT_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    body = {
+        "subscriber_id": subscriber_id,
+        "data": {
+            "version": "v2",
+            "content": {
+                "messages": [{"type": "text", "text": text}],
+            },
+        },
+        "message_tag": "ACCOUNT_UPDATE",  # standard tag for permission-granted comment-trigger DMs
+    }
+    try:
+        resp = httpx.post(
+            f"{MANYCHAT_API_BASE}/fb/sending/sendContent",
+            headers=headers, json=body, timeout=8.0,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            if data.get("status") == "success":
+                return True, ""
+            return False, f"manychat: {data.get('message', 'no message')}"
+        return False, f"HTTP {resp.status_code}: {resp.text[:200]}"
+    except Exception as exc:
+        return False, f"{type(exc).__name__}: {exc}"
+
+
+def _manychat_add_tag(subscriber_id: str, tag: str) -> tuple[bool, str]:
+    """Apply a tag (creates the tag if it doesn't exist)."""
+    if not MANYCHAT_API_KEY:
+        return False, "MANYCHAT_API_KEY not configured"
+    headers = {
+        "Authorization": f"Bearer {MANYCHAT_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    body = {"subscriber_id": subscriber_id, "tag_name": tag}
+    try:
+        resp = httpx.post(
+            f"{MANYCHAT_API_BASE}/fb/subscriber/addTagByName",
+            headers=headers, json=body, timeout=5.0,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            if data.get("status") == "success":
+                return True, ""
+            return False, f"manychat: {data.get('message', 'no message')}"
+        return False, f"HTTP {resp.status_code}: {resp.text[:200]}"
+    except Exception as exc:
+        return False, f"{type(exc).__name__}: {exc}"
+
+
+@app.get("/meta/webhook")
+def meta_verify(
+    hub_mode: str = Query("", alias="hub.mode"),
+    hub_challenge: str = Query("", alias="hub.challenge"),
+    hub_verify_token: str = Query("", alias="hub.verify_token"),
+):
+    """Meta calls this once to verify webhook ownership. Echo back the
+    challenge if our verify token matches what we configured in Meta."""
+    if hub_mode == "subscribe" and hub_verify_token == META_VERIFY_TOKEN:
+        return HTMLResponse(hub_challenge, status_code=200)
+    raise HTTPException(status_code=403, detail="verify_token mismatch")
+
+
+@app.post("/meta/webhook")
+async def meta_handle(request: Request) -> JSONResponse:
+    """Meta POSTs every IG comment event here.
+
+    Payload shape (Instagram comment):
+        {
+          "object": "instagram",
+          "entry": [{
+            "id": "<ig_business_account_id>",
+            "time": 1234567890,
+            "changes": [{
+              "field": "comments",
+              "value": {
+                "id": "<comment_id>",
+                "text": "DMS",
+                "from": {"id": "<commenter_ig_id>", "username": "<commenter_username>"},
+                "media": {"id": "<post_id>", ...}
+              }
+            }]
+          }]
+        }
+    """
+    payload = await request.json()
+    print(f"[meta] payload: {json.dumps(payload)[:500]}", file=sys.stderr)
+
+    if payload.get("object") != "instagram":
+        return JSONResponse({"ok": True, "reason": "not_instagram"})
+
+    manifest, source = _load_manifest()
+    known = set(manifest.keys())
+    results = []
+
+    for entry in payload.get("entry", []):
+        entry_id = str(entry.get("id", ""))
+        if META_IG_BUSINESS_ID and entry_id != META_IG_BUSINESS_ID:
+            results.append({"skipped": "different_ig_account", "id": entry_id})
+            continue
+        for change in entry.get("changes", []):
+            if change.get("field") != "comments":
+                continue
+            value = change.get("value", {})
+            comment_text = (value.get("text") or "").strip()
+            commenter_username = (value.get("from", {}).get("username") or "").strip()
+            commenter_ig_id = str(value.get("from", {}).get("id") or "")
+            if not commenter_username:
+                results.append({"skipped": "no_commenter_username"})
+                continue
+
+            kw = _extract_keyword(comment_text, known)
+            if not kw:
+                results.append({"comment": comment_text[:80], "skipped": "no_keyword"})
+                continue
+            entry_data = manifest.get(kw)
+            if not entry_data:
+                results.append({"keyword": kw, "skipped": "unknown_keyword"})
+                continue
+
+            title = entry_data.get("title") or "the playbook"
+            view_url = entry_data.get("view_url") or ""
+            tag = f"got_{kw.lower()}"
+            dm_text = render_dm_body(title, view_url)
+
+            # Look up the commenter in ManyChat by IG username, then DM them.
+            subscriber_id, err = _manychat_find_subscriber_by_ig_username(commenter_username)
+            if not subscriber_id:
+                # Fallback: send DM directly via Instagram Graph API would go here.
+                # For now: log and skip.
+                results.append({
+                    "keyword": kw,
+                    "commenter": commenter_username,
+                    "skipped": f"subscriber_lookup_failed: {err}",
+                })
+                continue
+
+            sent_ok, send_err = _manychat_send_content(subscriber_id, dm_text)
+            tag_ok, tag_err = _manychat_add_tag(subscriber_id, tag)
+            results.append({
+                "keyword": kw,
+                "commenter": commenter_username,
+                "subscriber_id": subscriber_id,
+                "dm_sent": sent_ok,
+                "dm_error": send_err,
+                "tag_applied": tag_ok,
+                "tag_error": tag_err,
+            })
+
+    print(f"[meta] results: {json.dumps(results)[:500]}", file=sys.stderr)
+    # Meta requires a 200 ack; details only for our logs
+    return JSONResponse({"ok": True, "processed": results})
 
 
 @app.get("/_debug/subscriber")
