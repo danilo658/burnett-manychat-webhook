@@ -1,0 +1,26 @@
+# Render deployment config. After connecting this repo to Render, the dashboard
+# will pick up this file automatically and provision the service.
+#
+# Free tier note: Render free instances cold-start after 15 minutes of
+# inactivity, which means the first comment trigger after idle may experience
+# ~30s of latency while the dyno spins up. For production, upgrade the plan
+# to "Starter" (~$7/mo) which keeps the instance always-on.
+services:
+  - type: web
+    name: burnett-manychat-webhook
+    runtime: python
+    region: oregon
+    plan: free
+    rootDir: automation/manychat_webhook
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT --workers 1
+    healthCheckPath: /health
+    envVars:
+      - key: MANIFEST_URL
+        # Set in dashboard — the raw URL of manifest.json in your repo
+        sync: false
+      - key: WEBHOOK_SECRET
+        # Set in dashboard — random string ManyChat passes as ?secret=...
+        generateValue: true
+      - key: MANIFEST_CACHE_TTL
+        value: "60"
