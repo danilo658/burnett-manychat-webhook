@@ -262,6 +262,36 @@ def _fetch_subscriber_last_input(subscriber_id: str) -> tuple[str | None, str]:
     return None, last_err or "all endpoints failed"
 
 
+@app.get("/_debug/subscriber")
+def debug_subscriber(
+    user_id: str = Query(..., description="subscriber_id to inspect"),
+    secret: str = Query("", description="Shared secret"),
+) -> JSONResponse:
+    """Inspect EVERY field ManyChat returns for a subscriber — for figuring
+    out which field actually carries the comment text on IG comment triggers.
+    """
+    if WEBHOOK_SECRET and secret != WEBHOOK_SECRET:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    if not MANYCHAT_API_KEY:
+        return JSONResponse({"error": "MANYCHAT_API_KEY not set in env"}, status_code=500)
+    headers = {"Authorization": f"Bearer {MANYCHAT_API_KEY}"}
+    results: dict = {}
+    for url in [
+        f"{MANYCHAT_API_BASE}/fb/subscriber/getInfo",
+        f"{MANYCHAT_API_BASE}/instagram/subscriber/getInfo",
+    ]:
+        try:
+            resp = httpx.get(url, headers=headers,
+                             params={"subscriber_id": user_id}, timeout=8.0)
+            results[url] = {
+                "status_code": resp.status_code,
+                "body": resp.json() if "application/json" in resp.headers.get("content-type", "") else resp.text[:500],
+            }
+        except Exception as exc:
+            results[url] = {"error": f"{type(exc).__name__}: {exc}"}
+    return JSONResponse(results)
+
+
 @app.get("/dm_apifetch")
 def dm_apifetch(
     user_id: str = Query(..., description="ManyChat subscriber_id (substitutes correctly via Contact Id)"),
