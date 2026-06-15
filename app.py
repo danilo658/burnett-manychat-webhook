@@ -37,7 +37,7 @@ from typing import Any
 import html as html_lib
 
 import httpx
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import Body, FastAPI, HTTPException, Query
 from fastapi.responses import HTMLResponse, JSONResponse
 
 # ---------------------------------------------------------------------------
@@ -216,6 +216,24 @@ def dm(
         "manifest_source": source,
         "user_id": user_id,
     })
+
+
+@app.post("/dm")
+def dm_post(
+    payload: dict = Body(...),
+) -> JSONResponse:
+    """POST /dm with JSON body. Same logic as GET, just different transport.
+
+    ManyChat's External Request sometimes substitutes variables in POST bodies
+    even when it doesn't substitute them in URL query parameters. If you're
+    hitting that bug, switch your External Request to POST + the body:
+        {"text": "{{last_input_text}}", "user_id": "{{contact.id}}", "secret": "..."}
+    """
+    keyword = (payload.get("keyword") or "").strip()
+    text = (payload.get("text") or "").strip()
+    user_id = (payload.get("user_id") or "").strip()
+    secret = (payload.get("secret") or "").strip()
+    return dm(keyword=keyword, text=text, user_id=user_id, secret=secret)
 
 
 @app.get("/")
